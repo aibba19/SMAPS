@@ -1,0 +1,32 @@
+﻿# Ignore Python cache
+__pycache__/
+*.py[cod]
+
+# Ignore VS project files
+.vs/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+*.pyproj*
+
+# Ignore virtual environment folder
+smaps_env/
+.env
+
+# Ignore log and output files
+*.log
+*.json
+*.txt
+
+# Ignore other outputs
+pipeline_output.json
+r2m_spatial_report.txt
+near_lists.txt
+extracted_entities.txt
+ifc_types_names.txt
+
+# Ignore any temp or backup files
+*.bak
+*.tmp
+*~
