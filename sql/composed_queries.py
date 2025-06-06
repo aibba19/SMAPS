@@ -271,6 +271,7 @@ def on_top_relation(object_x_id, object_y_id, camera_id, scale_factor):
       2) checking “above” via above.sql.
     Returns a multi-line explanation with object IDs.
     """
+    relation_flag = 0
     conn = get_connection()
     explanation = []
 
@@ -302,8 +303,9 @@ def on_top_relation(object_x_id, object_y_id, camera_id, scale_factor):
             explanation.append(
                 f"Conclusion: Object X (ID={object_x_id}) is on top of Object Y (ID={object_y_id})."
             )
+            relation_flag = 1
             conn.close()
-            return "\n".join(explanation)
+            return relation_flag, "\n".join(explanation)
 
     # Step 3: does Y touch X?
     flag_yx = run_query(conn, touches_sql, (object_y_id, object_x_id))[0][0]
@@ -328,15 +330,17 @@ def on_top_relation(object_x_id, object_y_id, camera_id, scale_factor):
             explanation.append(
                 f"Conclusion: Object Y (ID={object_y_id}) is on top of Object X (ID={object_x_id})."
             )
+            relation_flag = 1
             conn.close()
-            return "\n".join(explanation)
+            return relation_flag, "\n".join(explanation)
 
     # Neither orientation works
     explanation.append(
         "Conclusion: Neither object is on top of the other by the 'touches + above' criteria."
     )
+    
     conn.close()
-    return "\n".join(explanation)
+    return relation_flag, "\n".join(explanation)
 
 
 
@@ -350,6 +354,7 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
       ∃ o₃ [Touches(o₂, o₃) ∧ Below(o₃, o₂, Fc)].
     Uses touches.sql, above.sql, below.sql, and a single EXISTS for the support‐from‐below check.
     """
+    relation_flag = 0
     conn = get_connection()
     explanation = []
 
@@ -366,7 +371,7 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
     if not touches_flag:
         explanation.append("→ No 3D‐touch; aborting LeansOn.")
         conn.close()
-        return "\n".join(explanation)
+        return relation_flag, "\n".join(explanation)
 
     # Step 2: ensure o₂ is neither above nor below o₁
     above_row = run_query(
@@ -380,7 +385,7 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
     if above_flag:
         explanation.append("→ It is above; cannot lean on.")
         conn.close()
-        return "\n".join(explanation)
+        return relation_flag, "\n".join(explanation)
 
     below_row = run_query(
         conn, below_sql, (object2_id, object1_id, camera_id, scale_factor)
@@ -393,7 +398,7 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
     if below_flag:
         explanation.append("→ It is below; cannot lean on.")
         conn.close()
-        return "\n".join(explanation)
+        return relation_flag, "\n".join(explanation)
 
     # Step 3: ∃ o₃ supporting below o₂?
     exists_sql = """
@@ -433,14 +438,16 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
         explanation.append(
             f"Conclusion: Object2 (ID={object2_id}) LEANS ON Object1 (ID={object1_id})."
         )
+        relation_flag = 1
     else:
         explanation.append(
             f"Conclusion: No supporting object below o₂ → "
             f"Object2 (ID={object2_id}) does NOT lean on Object1 (ID={object1_id})."
         )
+        relation_flag = 0
 
     conn.close()
-    return "\n".join(explanation)
+    return relation_flag, "\n".join(explanation)
 
 
 
@@ -452,6 +459,7 @@ def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
       Touches(o₂,o₁) ∧ ¬Above(o₂,o₁,Fc) ∧ ¬∃o₃ Touches(o₃,o₂)
     Uses touches.sql, above.sql, and one EXISTS for the final check.
     """
+    relation_flag = 0
     conn = get_connection()
     explanation = []
 
@@ -467,7 +475,7 @@ def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
     if not flag_touch:
         explanation.append("→ Does not touch; cannot be affixed.")
         conn.close()
-        return "\n".join(explanation)
+        return relation_flag, "\n".join(explanation)
 
     # Step 2: Ensure o₂ is not above o₁
     above_row = run_query(
@@ -483,7 +491,7 @@ def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
     if above_flag:
         explanation.append("→ It is above; cannot be affixed.")
         conn.close()
-        return "\n".join(explanation)
+        return relation_flag, "\n".join(explanation)
 
     # Step 3: Verify NO other o₃ touches o₂ using ST_3DDWithin (0.1 m tolerance)
     no_other_sql = """
@@ -515,13 +523,15 @@ def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
         explanation.append(
             f"Conclusion: Object2 (ID={object2_id}) is AFFIXED TO Object1 (ID={object1_id})."
         )
+        relation_flag = 1
     else:
         explanation.append(
             f"Conclusion: Object2 (ID={object2_id}) is NOT affixed to Object1 (ID={object1_id}); another object touches it."
         )
+        relation_flag = 0
 
     conn.close()
-    return "\n".join(explanation)
+    return relation_flag, explanation
 
 
 

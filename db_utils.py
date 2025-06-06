@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any, Tuple
 
+
+
 # ---------------------------------------------------------------------------
 # Original helpers (unchanged)
 # ---------------------------------------------------------------------------
@@ -51,6 +53,39 @@ def run_query(conn, query: str, params: Tuple[Any, ...] = None):
 # ---------------------------------------------------------------------------
 SQL_DIR = Path(__file__).with_suffix("").parent / "sql"
 
+# ---------------------------------------------------------------------------
+# Composed‑relation Python functions
+# ---------------------------------------------------------------------------
+def _import_composed_funcs():
+    """
+    Load SQL/composed_queries.py regardless of package layout and
+    return its three relation functions.
+    """
+    try:
+        # Preferred: sql is a package:  from sql.composed_queries import ...
+        from sql.composed_queries import (
+            on_top_relation,
+            leans_on_relation,
+            affixed_to_relation,
+        )
+    except ImportError:
+        # Fallback: load the file directly
+        comp_path = "sql/composed_queries.py"
+        spec = importlib.util.spec_from_file_location("composed_queries", comp_path)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(module)                 # type: ignore[union-attr]
+        on_top_relation = module.on_top_relation        # type: ignore[attr-defined]
+        leans_on_relation = module.leans_on_relation    # type: ignore[attr-defined]
+        affixed_to_relation = module.affixed_to_relation
+
+    return {
+        "on_top_of": on_top_relation,
+        "leans_on": leans_on_relation,
+        "affixed_to": affixed_to_relation,
+    }
+
+
+COMPOSED_FUNCS = _import_composed_funcs()
 
 def load_query(file_or_path: str | Path) -> str:
     """
@@ -88,41 +123,6 @@ def run_template_query3(conn, tpl, id1, id2, thresh):
 
 def run_template_query2(conn, tpl, id1, id2):
     return _template_query(conn, tpl, (id1, id2))
-
-
-# ---------------------------------------------------------------------------
-# Composed‑relation Python functions
-# ---------------------------------------------------------------------------
-def _import_composed_funcs():
-    """
-    Load SQL/composed_queries.py regardless of package layout and
-    return its three relation functions.
-    """
-    try:
-        # Preferred: sql is a package:  from sql.composed_queries import ...
-        from sql.composed_queries import (
-            on_top_relation,
-            leans_on_relation,
-            affixed_to_relation,
-        )
-    except ImportError:
-        # Fallback: load the file directly
-        comp_path = SQL_DIR / "composed_queries.py"
-        spec = importlib.util.spec_from_file_location("composed_queries", comp_path)
-        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(module)                 # type: ignore[union-attr]
-        on_top_relation = module.on_top_relation        # type: ignore[attr-defined]
-        leans_on_relation = module.leans_on_relation    # type: ignore[attr-defined]
-        affixed_to_relation = module.affixed_to_relation
-
-    return {
-        "on_top_of": on_top_relation,
-        "leans_on": leans_on_relation,
-        "affixed_to": affixed_to_relation,
-    }
-
-
-COMPOSED_FUNCS = _import_composed_funcs()
 
 
 # ---------------------------------------------------------------------------
@@ -188,23 +188,15 @@ def run_spatial_call(
 
             # composed Python relations
             elif tpl_key in COMPOSED_FUNCS:
+                _import_composed_funcs()
                 func = COMPOSED_FUNCS[tpl_key]
-                if tpl_key == "on_top_of":
-                    result = func(
-                        call["b_id"],                   # x_id
-                        call["a_id"],                   # y_id
-                        call.get("camera_id", camera_default),
-                        call.get("s", s_default),
-                    )
-                else:  # leans_on / affixed_to
-                    result = func(
-                        call["b_id"],
-                        call["a_id"],
-                        call.get("camera_id", camera_default),
-                        call.get("s", s_default),
-                    )
-                # wrap in list-of-tuples for uniformity
-                rows = [(result,)]
+                result = func(
+                    call["b_id"],
+                    call["a_id"],
+                    call.get("camera_id", camera_default),
+                    call.get("s", s_default),
+                )
+                rows = [result]
 
             else:
                 return {
