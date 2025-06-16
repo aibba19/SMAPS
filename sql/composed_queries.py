@@ -346,8 +346,9 @@ def on_top_relation(object_x_id, object_y_id, camera_id, scale_factor):
 
 
 #OPTIMIZED VERSION
-def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
+def leans_on_relation(object1_id, object2_id, camera_id, scale_factor):
     """
+    Check if o2 leans on o1
     LeansOn(o₂, o₁, Fc) ⇔ 
       Touches(o₂, o₁) ∧ 
       ¬Above(o₂, o₁, Fc) ∧ ¬Below(o₂, o₁, Fc) ∧ 
@@ -433,7 +434,7 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
     )[0][0]
     explanation.append(f"Step 3: ∃ o₃ supporting below o₂? => {support_exists}")
 
-    # … Conclusion unchanged …
+    # … Conclusion …
     if support_exists:
         explanation.append(
             f"Conclusion: Object2 (ID={object2_id}) LEANS ON Object1 (ID={object1_id})."
@@ -453,8 +454,9 @@ def leans_on_relation(object2_id, object1_id, camera_id, scale_factor):
 
 
 #OPTIMIED VERSION 
-def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
+def affixed_to_relation(object1_id, object2_id, camera_id, scale_factor):
     """
+    Check if o2 affixed to o1
     AffixedTo(o₂,o₁,Fc) ⇔
       Touches(o₂,o₁) ∧ ¬Above(o₂,o₁,Fc) ∧ ¬∃o₃ Touches(o₃,o₂)
     Uses touches.sql, above.sql, and one EXISTS for the final check.
@@ -481,7 +483,7 @@ def affixed_to_relation(object2_id, object1_id, camera_id, scale_factor):
     above_row = run_query(
         conn,
         above_sql,
-        (object2_id, object1_id, camera_id, scale_factor)
+        (object1_id, object2_id, camera_id, scale_factor)
     )[0]
     above_flag = above_row[3]
     rel_above  = above_row[4]

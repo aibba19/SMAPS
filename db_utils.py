@@ -191,8 +191,8 @@ def run_spatial_call(
                 _import_composed_funcs()
                 func = COMPOSED_FUNCS[tpl_key]
                 result = func(
-                    call["b_id"],
                     call["a_id"],
+                    call["b_id"],
                     call.get("camera_id", camera_default),
                     call.get("s", s_default),
                 )
