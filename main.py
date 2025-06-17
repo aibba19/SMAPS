@@ -67,9 +67,9 @@ TEMPLATE_CATALOGUE = {
 # ──────────────────────────────────────────────────────────────────────────
 CHECKS = {
     "extinguisher_check2": (
-        #"Are all portable fire extinguishers readily accessible and not restricted by stored items?"
+        "Are all portable fire extinguishers readily accessible and not restricted by stored items?"
         #"Have combustible materials been stored away from sources of ignition?"
-        "Are portable fire extinguishers either securely wall mounted or on a supplied stand?"
+        #"Are portable fire extinguishers either securely wall mounted or on a supplied stand?"
     ),
 }
 
@@ -562,6 +562,9 @@ def process_checks(
 
     return pipeline_results
 
+# ──────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────
 
 def main():
     """
@@ -617,7 +620,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-''' 
+    '''
     # ————— Define your checks —————
     checks = {
         "waste_check":         "Is waste and rubbish kept in a designated area?",
