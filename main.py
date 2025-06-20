@@ -15,6 +15,8 @@ from prompts.spatial_planner2 import spatial_planner
 from prompts.entity_extraction2 import extract_entities
 from prompts.decompose_rule import decompose_rule
 from prompts.evaluate_rule import evaluate_rule
+from prompts.decide_plan_polarity import decide_plan_polarity
+from prompts.create_summaries import summarise_spatial_results
 
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -66,12 +68,36 @@ TEMPLATE_CATALOGUE = {
 # 1.  Define the H&S checks you want to run
 # ──────────────────────────────────────────────────────────────────────────
 CHECKS = {
+    "extinguisher_check1": (
+        "Are all portable fire extinguishers readily accessible and not restricted by stored items?"   
+    ),
     "extinguisher_check2": (
-        "Are all portable fire extinguishers readily accessible and not restricted by stored items?"
-        #"Have combustible materials been stored away from sources of ignition?"
-        #"Are portable fire extinguishers either securely wall mounted or on a supplied stand?"
+        "Are portable fire extinguishers either securely wall mounted or on a supplied stand?"   
+    ),
+    "extinguisher_check3": (
+        "Are portable fire extinguishers clearly labelled?"   
+    ),
+    "ignition_check": (
+        "Have combustible materials been stored away from sources of ignition?"   
     ),
 }
+
+'''
+    # ————— Define your checks —————
+    checks = {
+        "waste_check":         "Is waste and rubbish kept in a designated area?", # Da aggiungere oggetto area
+        "ignition_check":      "Have combustible materials been stored away from sources of ignition?", # Fatto da integrare
+        "fire_call_check":     "Are all fire alarm call points clearly signed and easily accessible?", # si può fare facile
+        "fire_escape_check1":  "Are all fire exit signs in place and unobstructed?", # si può fare facile
+        "fire_escape_check2":  "Are fire escape routes kept clear?", # da aggiungere fire escape routes come oggetto
+        "fall_check":          "Is the condition of all flooring free from trip hazards?", # da aggiungere routes come oggetto
+        "door_check":          "Are fire doors kept closed, i.e., not wedged open?", # Da aggiungere attributo a porte
+        "extinguisher_check1": "Are portable fire extinguishers clearly labelled?", # si può fare facile 
+        "extinguisher_check2": "Are all portable fire extinguishers readily accessible and not restricted by stored items?", # Fatto
+        "extinguisher_check3": "Are portable fire extinguishers either securely wall mounted or on a supplied stand?" # Fatto
+    }
+    
+    '''
 
 
 def test_r2m_office_db():
@@ -275,32 +301,27 @@ def execute_spatial_calls(
     log_file
 ) -> List[Dict]:
     """
-    Execute spatial calls (SQL templates) for each entry in the plan, logging and collecting positive relations.
+    Execute spatial calls (SQL templates) for each entry in the plan, logging and collecting
+    either positive or negative relations according to the entry's `use_positive` flag.
 
-    Parameters
-    ----------
-    plan            : The "plans" dict returned by spatial_planner()
-    id_to_obj       : ID→(ifc_type, name) map
-    type_to_ids     : ifc_type→[IDs] map
-    all_ids         : List of all object IDs
-    conn            : Active psycopg2 connection
-    template_paths  : Template name → file path map
-    log_file        : Open file handle for logging
+    Now reads `use_positive` from each plan entry:
+      - If True, collects only held==True relations (as before).
+      - If False, collects only held==False relations.
     """
     print("DEBUG: Executing spatial calls for each planned relation...")
-    positive_relations: List[Dict] = []
+    results: List[Dict] = []
 
     # Iterate through each planned check entry
     for entry in plan.get("plans", []):
-        idx = entry["check_index"]
-        relation_text = entry.get("relation_text", "")
-        templates_list = [t["template"] for t in entry["templates"]]
+        idx          = entry["check_index"]
+        use_positive = entry.get("use_positive", True)
+        print(f"DEBUG: check_index={idx}, use_positive={use_positive}")
 
         for tmpl in entry["templates"]:
             tpl_name = tmpl["template"]
             a_src, b_src = tmpl["a_source"], tmpl["b_source"]
 
-            # Determine the list of 'a' IDs (reference)
+            # Determine reference IDs (a_ids)
             if a_src == "reference_ids":
                 a_ids = entry["reference"]["reference_ids"]
             elif a_src == "reference_ifc_types":
@@ -312,7 +333,7 @@ def execute_spatial_calls(
             else:  # any_nearby
                 a_ids = entry["reference"]["reference_ids"]
 
-            # Determine the list of 'b' IDs (against)
+            # Determine against IDs (b_ids)
             if b_src == "against_ids":
                 b_ids = entry["against"]["against_ids"]
             elif b_src == "against_ifc_types":
@@ -324,75 +345,61 @@ def execute_spatial_calls(
             else:  # any_nearby
                 b_ids = all_ids
 
-            # Run the spatial function 1-to-1 for each pair of a_id and b_id
+            # Run the spatial function 1-to-1 for each pair
             for a_id in a_ids:
                 a_type, a_name = id_to_obj[a_id]
                 for b_id in b_ids:
                     if a_id == b_id:
-                        continue  # skip self-comparisons
+                        continue
+
                     b_type, b_name = id_to_obj[b_id]
+                    call = {"type":"template","template":tpl_name,"a_id":b_id,"b_id":a_id}
 
-                    call = {
-                        "type":     "template",
-                        "template": tpl_name,
-                        "a_id":     b_id,
-                        "b_id":     a_id
-                    }
-
-                    # --- Log the call request ---
+                    # Log request
                     log_file.write("=== SPATIAL CALL ===\n")
                     log_file.write(json.dumps(call, ensure_ascii=False) + "\n")
 
-                    # Execute the SQL template via run_spatial_call
                     result = run_spatial_call(conn, call, template_paths)
 
-                    # --- Log the result ---
+                    # Log result
                     log_file.write("RESULT:\n")
                     log_file.write(json.dumps(result, ensure_ascii=False) + "\n\n")
                     log_file.flush()
 
-                    # Determine if relation held based on result rows
+                    # Determine held
                     held = False
-                    relation_value = ""
                     rows = result.get("rows", [])
+                    relation_value = None
                     if rows:
                         first = rows[0]
+                        # Here every query should be stantardized for optimization so the output can be accessed in the same way
                         if tpl_name == "touches":
-                            held = bool(first[0])
-                            relation_value = first[1]
-                        elif tpl_name in {"front", "left", "right", "behind", "above", "below"}:
-                            held = bool(first[3])
-                            relation_value = first[4] if held else None
-                        elif tpl_name in {"near", "far"}:
-                            # near_far.sql returns [relation, distance, is_near, is_far]
-                            relation_text = first[0]
-                            is_near_flag = first[2]
-                            is_far_flag = first[3]
-                            if tpl_name == "near":
-                                held = bool(is_near_flag)
-                            else:
-                                held = bool(is_far_flag)
-                            relation_value = relation_text if held else None
-                        elif tpl_name in {"affixed_to", "leans_on", "on_top_of"}:
-                            held = bool(first[0])
-                            relation_value = first[1]
+                            held = bool(first[0]);       relation_value = first[1]
+                        elif tpl_name in {"front","left","right","behind","above","below"}:
+                            held = bool(first[3]);       relation_value = first[4] if held else None
+                        elif tpl_name in {"near","far"}:
+                            is_near = bool(first[2]);    is_far = bool(first[3])
+                            held = is_near if tpl_name=="near" else is_far
+                            relation_value = first[0]
+                        else:  # composed relations
+                            held = bool(first[0]);       relation_value = first[1] if len(first)>1 else None
 
-                    # If relation holds, record it
-                    if held:
-                        positive_relations.append({
-                            "check_index":     idx,
-                            "template":        tpl_name,
-                            "a_id":            a_id,
-                            "a_name":          a_name,
-                            "a_type":          a_type,
-                            "b_id":            b_id,
-                            "b_name":          b_name,
-                            "b_type":          b_type,
-                            "relation_value":  relation_value
+                    # Record only if held matches use_positive
+                    if held == use_positive:
+                        results.append({
+                            "check_index":    idx,
+                            "template":       tpl_name,
+                            "a_id":           a_id,
+                            "a_name":         a_name,
+                            "a_type":         a_type,
+                            "b_id":           b_id,
+                            "b_name":         b_name,
+                            "b_type":         b_type,
+                            "relation_value": relation_value
                         })
 
-    print(f"DEBUG: Found {len(positive_relations)} positive relations.\n")
-    return positive_relations
+    print(f"DEBUG: Collected {len(results)} relations (use_positive={use_positive}).\n")
+    return results
 
 
 def build_summaries(
@@ -519,30 +526,36 @@ def process_checks(
 
     for key, rule in CHECKS.items():
         print(f"\n=== Processing check: {key} ===")
-        print(f"DEBUG: Rule text: {rule}\n")
+        #print(f"DEBUG: Rule text: {rule}\n")
 
         # A) Decompose rule into subchecks
         print("DEBUG: Decomposing rule...")
         decomposed = decompose_rule(rule, client)
-        print("DEBUG: Decomposed checks:", json.dumps(decomposed, indent=2, ensure_ascii=False), "\n")
+        #print("DEBUG: Decomposed checks:", json.dumps(decomposed, indent=2, ensure_ascii=False), "\n")
 
         # B) Enrich decomposed checks with entities from DB
         print("DEBUG: Enriching decomposed checks with entities...")
         enriched = extract_entities(decomposed, all_objects, client)
-        print("DEBUG: Enriched entities:", json.dumps(enriched, indent=2, ensure_ascii=False), "\n")
+        #print("DEBUG: Enriched entities:", json.dumps(enriched, indent=2, ensure_ascii=False), "\n")
 
         # C) Plan spatial queries using the LLM-based planner
         print("DEBUG: Planning spatial queries...")
         plan = spatial_planner(enriched, TEMPLATE_CATALOGUE, client)
-        print("DEBUG: Spatial plan:", json.dumps(plan, indent=2, ensure_ascii=False), "\n")
+        #print("DEBUG: Spatial plan:", json.dumps(plan, indent=2, ensure_ascii=False), "\n")
+
+        # D) Enrich spatial plans adding entries for plan polarity
+        print("DEBUG: Deciding Spatial Plan Polarity...")
+        enriched_plan = decide_plan_polarity(rule, plan, client)
+        #print("DEBUG: Enriched Spatial plan with Polarity:", json.dumps(enriched_plan, indent=2, ensure_ascii=False), "\n")
 
         # D) Execute spatial calls and collect positive relations
-        positive_relations = execute_spatial_calls(
-            plan, id_to_obj, type_to_ids, all_ids, conn, template_paths, log_file
+        relations = execute_spatial_calls(
+            enriched_plan, id_to_obj, type_to_ids, all_ids, conn, template_paths, log_file
         )
 
         # E) Build human-readable summaries from positive relations
-        summaries = build_summaries(plan, positive_relations, id_to_obj)
+        #summaries = build_summaries(plan, relations, id_to_obj)
+        summaries= summarise_spatial_results(plan,relations,client)
 
         # F) Evaluate rule compliance using the summaries and original rule
         print("DEBUG: Evaluating rule compliance...")
@@ -555,7 +568,7 @@ def process_checks(
             "decomposed_checks": decomposed,
             "enriched_checks":   enriched,
             "spatial_plan":      plan,
-            "positive_results":  positive_relations,
+            "results":           relations,
             "summaries":         summaries,
             "evaluation":        evaluation
         }
@@ -619,20 +632,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    '''
-    # ————— Define your checks —————
-    checks = {
-        "waste_check":         "Is waste and rubbish kept in a designated area?",
-        "ignition_check":      "Have combustible materials been stored away from sources of ignition?",
-        "fire_call_check":     "Are all fire alarm call points clearly signed and easily accessible?",
-        "fire_escape_check1":  "Are all fire exit signs in place and unobstructed?",
-        "fire_escape_check2":  "Are fire escape routes kept clear?",
-        "fall_check":          "Is the condition of all flooring free from trip hazards?",
-        "door_check":          "Are fire doors kept closed, i.e., not wedged open?",
-        "extinguisher_check1": "Are portable fire extinguishers clearly labelled?",
-        "extinguisher_check2": "Are all portable fire extinguishers readily accessible and not restricted by stored items?",
-        "extinguisher_check3": "Are portable fire extinguishers either securely wall mounted or on a supplied stand?"
-    }
-    
-    '''
