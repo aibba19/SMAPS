@@ -12,6 +12,7 @@ __pycache__/
 
 # Ignore virtual environment folder
 smaps_env/
+outputs_results/
 .env
 
 # Ignore log and output files
