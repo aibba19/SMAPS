@@ -1,6 +1,5 @@
 ﻿import os
-from db_utils import get_connection, run_query
-from main import load_query
+from db_utils import get_connection, run_query, load_query
 
 
 #OLD VERSIONS NOT OPTIMIZED

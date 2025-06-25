@@ -1,24 +1,34 @@
 ﻿import json
 import re
-from typing import List, Dict
-import openai
+from typing import List, Dict, Any
 
-def evaluate_rule(rule: str, summaries: List[str], client, model = "gpt-4.1-mini-2025-04-14" ) -> Dict:
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+
+def evaluate_rule(
+    rule: str,
+    summaries: List[str],
+    client,
+    model: str = "gpt-4.1-mini-2025-04-14"
+) -> Dict[str, Any]:
     """
-    Given a health-and-safety rule and a list of spatial-check summaries,
-    ask the LLM whether the rule is respected, with a brief explanation.
+    Given a rule and spatial-check summaries, judge compliance and explain.
 
-    Returns a dict:
+    Returns:
       {
-        "compliant": true | false,
-        "explanation": "<brief reason>"
+        "entry_results": [{"summary":..., "compliant": true|false|null, "explanation":...}, ...],
+        "overall_compliant": true|false,
+        "overall_explanation": "..."
       }
     """
-
-    # Format summaries as bullet list
+    # Serialize summaries as bullet list
     summaries_md = "\n".join(f"- {s}" for s in summaries)
 
-    prompt = f"""
+    # Full task prompt (unchanged)
+    task_prompt = """
         <task_description>
         You must judge whether a health-and-safety rule is met, using only the
         spatial-query *summaries* provided.
@@ -59,33 +69,41 @@ def evaluate_rule(rule: str, summaries: List[str], client, model = "gpt-4.1-mini
               "compliant": true | false | null,
               "explanation": "<short reason>"
             }},
-            ...
+            …
           ],
           "overall_compliant": true | false,
           "overall_explanation": "<concise overall reason>"
         }}
         </task_description>
-
-        <rule>
-        {rule}
-        </rule>
-
-        <summaries>
-        {summaries_md}
-        </summaries>
         """
 
-    resp = client.chat.completions.create(
-        model= model,
+    # Human message with inputs appended after the task description
+    human_template = (
+        f"{task_prompt}\n\n"
+        "<rule>\n{rule}\n</rule>\n\n"
+        "<summaries>\n{summaries_md}\n</summaries>"
+    )
+
+    # Build prompt template
+    prompt_template = ChatPromptTemplate(
+        input_variables=["rule", "summaries_md"],
         messages=[
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user",   "content": prompt}
+            SystemMessagePromptTemplate.from_template("Return valid JSON only."),
+            HumanMessagePromptTemplate.from_template(human_template),
         ],
     )
 
-    content = resp.choices[0].message.content.strip()
-    # strip code fences if any
+    # Render and invoke LLM
+    rendered = prompt_template.format_prompt(
+        rule=rule,
+        summaries_md=summaries_md
+    ).to_messages()
+    result = client.invoke(rendered, model=model)
+
+    # Extract and clean output
+    content = getattr(result, "content", str(result)).strip()
     if content.startswith("```"):
         content = re.sub(r"```json\s*|\s*```", "", content, flags=re.IGNORECASE).strip()
 
+    # Parse JSON and return
     return json.loads(content)

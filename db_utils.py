@@ -224,3 +224,92 @@ def run_spatial_call(
     except Exception as exc:
         conn.rollback()
         return {"call": call, "status": "skipped", "rows": [], "reason": str(exc)}
+
+
+
+def test_r2m_office_db():
+    # ─── Configuration ────────────────────────────────────────────────────────
+    object_pairs = [
+        (98, 99),
+        (104, 78),
+        (1,  88),
+        (56, 98),
+        (98, 56),
+        (82, 83),
+        (8, 104),
+        (1, 52),
+        (5, 52),
+        (97, 102)
+    ]
+    camera_id    = 1      # for front/behind/left/right
+    scale_factor = 10.0   # for above, below, on_top, etc.
+
+    queries = {
+        "above":  "above.sql",
+        "below":  "below.sql",
+        "front":  "front.sql",
+        "behind": "behind.sql",
+        "left":   "left.sql",
+        "right":  "right.sql",
+    }
+
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        # Load all SQL texts
+        sql_texts = {name: load_query(fn) for name, fn in queries.items()}
+
+        # 1) Camera info
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, position, fov FROM camera WHERE id = %s", (camera_id,))
+            cam_id, cam_pos, cam_fov = cur.fetchone()
+        print(f"Camera ID={cam_id}, position={cam_pos}, fov={cam_fov}")
+
+        # 2) Build name map
+        all_ids = {oid for pair in object_pairs for oid in pair}
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name FROM room_objects WHERE id = ANY(%s)",
+                (list(all_ids),)
+            )
+            name_map = {row[0]: row[1] for row in cur.fetchall()}
+
+        # 3) Test each pair
+        for x_id, y_id in object_pairs:
+            x_name = name_map.get(x_id, f"ID {x_id}")
+            y_name = name_map.get(y_id, f"ID {y_id}")
+
+            print(f"\nObjects: {x_name} (ID {x_id}) → {y_name} (ID {y_id})")
+
+            # Camera‐dependent relations
+            for rel in ("front", "behind", "left", "right"):
+                sql = sql_texts[rel]
+                # note: these expect args (object_y_id, object_x_id, camera_id, s)
+                row = run_query(conn, sql, (y_id, x_id, camera_id, scale_factor))[0]
+                flag = row[3]
+                status = "is" if flag else "is NOT"
+                print(f"  [{rel.title():>6}] {x_name} {status} {rel} of {y_name}")
+
+            # Camera‐independent: above & below
+            above_row = run_query(conn, sql_texts["above"], (x_id, y_id,camera_id, scale_factor))[0]
+            above_flag = above_row[3]
+            below_row = run_query(conn, sql_texts["below"], (x_id, y_id,camera_id, scale_factor))[0]
+            below_flag = below_row[3]
+
+            print(f"  [Above ] {x_name} is{' ' if above_flag else ' NOT '}above {y_name}")
+            print(f"  [Below ] {x_name} is{' ' if below_flag else ' NOT '}below {y_name}")
+
+            # Composed relations
+            print("  [On Top]   composed on_top_relation:")
+            for line in on_top_relation(x_id, y_id, camera_id, scale_factor).splitlines():
+                print("    " + line)
+
+            print("  [Leans On] composed leans_on_relation:")
+            for line in leans_on_relation(x_id, y_id, camera_id, scale_factor).splitlines():
+                print("    " + line)
+
+            print("  [Affixed]  composed affixed_to_relation:")
+            for line in affixed_to_relation(x_id, y_id, camera_id, scale_factor).splitlines():
+                print("    " + line)
+
+    finally:
+        conn.close()

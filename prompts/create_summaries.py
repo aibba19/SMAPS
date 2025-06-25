@@ -1,46 +1,44 @@
 ﻿import json
 import re
-from tabnanny import check
-from typing import Dict, List, Any
-import openai
+from typing import List, Dict, Any
 
-def summarise_spatial_results(spatial_plan: Dict[str, Any],
-                              results: List[Dict[str, Any]],
-                              client,
-                              model: str = "gpt-4.1-mini-2025-04-14") -> List[str]:
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+
+
+def summarise_spatial_results(
+    spatial_plan: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    client,
+    model: str = "gpt-4.1-mini-2025-04-14"
+) -> List[str]:
     """
-    Given a spatial plan and its filtered results, produce one concise
-    English summary per check_index.
-
-    Input:
-      spatial_plan: {
-        "plans": [ { check_index, reference, against, templates, relation_text, use_positive }, … ]
-      }
-      results: [
-        { check_index, template, a_id, a_name, b_id, b_name, relation_value }, …
-      ]
-      client: OpenAI client
-      model:  LLM model name
-
-    Output:
-      A List[str] where each string summarizes one check_index, e.g.:
-        ["Check 0: Object 97 …", "Check 1: Object 1 …", …]
+    Given a spatial plan and its filtered results, produce concise English
+    summaries per check_index.
     """
-
+    # 1) Build check summaries
+    # Assuming extract_plan_descriptions is available
     check_descriptions = extract_plan_descriptions(spatial_plan)
+    check_summaries = "\n".join(check_descriptions)
 
-    #for d in check_descriptions:
-     #   print (d)
+    # Serialize results
+    results_json = json.dumps(results, indent=2, ensure_ascii=False)
 
-    prompt = f"""
-        <task_description>
+    # Full task prompt unchanged, to be sent in the human message
+    prompt_text = """
+       <task_description>
         You receive two inputs:
 
         1️⃣  <check_summaries> – one line per check_index created from the spatial plan,  
             e.g.  
-              Check 0: reference (category = "combustible materials") → IFC types ['IfcFurnishingElement', 'IfcBuildingElementProxy']; tested template(s) ["far"] against IFC types ['IfcElectricDistributionPoint', 'IfcFlowTerminal']; keeping not-held (negative) matches.
+              Check 0: reference (category = "combustible materials") → IFC types ['IfcFurnishingElement', 'IfcBuildingElementProxy']; 
+              tested template(s) ["far"] against IFC types ['IfcElectricDistributionPoint', 'IfcFlowTerminal']; keeping not-held (negative) matches.
 
-              Check 1: reference (object = "portable fire extinguisher") → object IDs [1, 2, 3, 107, 109]; tested template(s) ["near"] against all objects in the DB; keeping held (positive) matches.
+              Check 1: reference (object = "portable fire extinguisher") → object IDs [1, 2, 3, 107, 109]; tested template(s) ["near"] against all objects in the DB; 
+              keeping held (positive) matches.
 
 
 
@@ -81,88 +79,72 @@ def summarise_spatial_results(spatial_plan: Dict[str, Any],
 
         No markdown, no code fences, no extra keys.
         </task_description>
-
-        <check_summaries>
-        {chr(10).join(check_descriptions)}
-        </check_summaries>
-
-        <results>
-        {json.dumps(results, indent=2, ensure_ascii=False)}
-        </results>
         """
 
-    #print("DEBUG: Prompt for summarisation:")
-    #print(prompt)
-
-    resp = client.chat.completions.create(
-        model=model,
+    # Build prompt template
+    prompt_template = ChatPromptTemplate(
+        input_variables=["check_summaries", "results_json", "rule"],
         messages=[
-            {"role": "system", "content": "Return JSON array only."},
-            {"role": "user",   "content": prompt}
+            SystemMessagePromptTemplate.from_template("Return valid JSON only."),
+            HumanMessagePromptTemplate.from_template(
+                prompt_text + "\n<check_summaries>\n{check_summaries}\n</check_summaries>" +
+                "\n<results>\n{results_json}\n</results>"
+            ),
         ],
     )
 
-    content = resp.choices[0].message.content.strip()
-    #print("DEBUG: Raw LLM response:")
-    #print(content)
+    # Format and invoke
+    prompt_val = prompt_template.format_prompt(
+        check_summaries=check_summaries,
+        results_json=results_json
+    )
+    messages = prompt_val.to_messages()
+    result = client.invoke(messages, model=model)
 
-    # Strip code fences if any
+    # Extract content
+    content = getattr(result, "content", str(result)).strip()
     if content.startswith("```"):
-        content = re.sub(r"```json\s*|\s*```", "", content, flags=re.I).strip()
+        content = re.sub(r"```json\s*|```", "", content, flags=re.IGNORECASE).strip()
 
-    # Now parse directly as a JSON array
-    try:
-        summaries = json.loads(content)
-    except json.JSONDecodeError as e:
-        print("ERROR parsing summaries JSON:", e)
-        # Fallback: return the raw text as single-element list
-        return [content]
-
-    return summaries
+    # Parse JSON array of strings
+    return json.loads(content)
 
 
-def extract_plan_descriptions(spatial_plan: dict) -> list[str]:
+def extract_plan_descriptions(spatial_plan: dict) -> List[str]:
     """
-    Given a spatial_plan dict, return one concise string per check_index summarizing:
-      – reference type/value → underlying IFC types or object IDs
-      – which template(s) were run
-      – against which targets (IFC types, object IDs, or all objects)
-      – whether we’re keeping positive (held) or negative (not-held) matches
+    Convert spatial_plan entries into one-line summaries per check_index.
     """
-    descriptions = []
+    descriptions: List[str] = []
     for plan in spatial_plan.get("plans", []):
-        idx     = plan["check_index"]
-        ref     = plan["reference"]
-        ag      = plan["against"]
-        use_pos = plan["use_positive"]
+        idx = plan["check_index"]
+        ref = plan["reference"]
+        ag = plan["against"]
+        use_pos = plan.get("use_positive", True)
 
         # reference description
         if ref["type"] == "category":
-            ref_desc = f'IFC types {ref["reference_ifc_types"]}'
+            ref_desc = f'IFC types {ref.get("reference_ifc_types", [])}'
         elif ref["type"] == "object":
-            ref_desc = f'object IDs {ref["reference_ids"]}'
-        else:  # any
+            ref_desc = f'object IDs {ref.get("reference_ids", [])}'
+        else:
             ref_desc = "any object"
 
         # against description
         if ag["type"] == "category":
-            ag_desc = f'IFC types {ag["against_ifc_types"]}'
+            ag_desc = f'IFC types {ag.get("against_ifc_types", [])}'
         elif ag["type"] == "object":
-            ag_desc = f'object IDs {ag["against_ids"]}'
-        else:  # any
+            ag_desc = f'object IDs {ag.get("against_ids", [])}'
+        else:
             ag_desc = "all objects in the DB"
 
         # templates
         tmpl_names = [t["template"] for t in plan.get("templates", [])]
-        tmpl_list  = ", ".join(f'"{n}"' for n in tmpl_names)
+        tmpl_list = ", ".join(f'"{n}"' for n in tmpl_names)
 
-        # polarity
         polarity = "held (positive)" if use_pos else "not-held (negative)"
 
         descriptions.append(
-            f'Check {idx}: reference ({ref["type"]} = "{ref["value"]}") → {ref_desc}; '
-            f'tested template(s) [{tmpl_list}] against {ag_desc}; '
-            f'keeping {polarity} matches.'
+            f'Check {idx}: reference ({ref["type"]} = \"{ref["value"]}\") → {ref_desc}; '
+            f'tested template(s) [{tmpl_list}] against {ag_desc}; keeping {polarity} matches.'
         )
-
     return descriptions

@@ -1,28 +1,22 @@
-﻿import json
-import logging
-import os
-import re
-import psycopg2 
-from psycopg2 import sql
-from config import DB_CONFIG
-from config import MY_OPENAI_KEY
-from sql.composed_queries import *
-from db_utils import *
-import json
-import openai
-
-from prompts.spatial_planner2 import spatial_planner
-from prompts.entity_extraction2 import extract_entities
+﻿from typing import Any, Dict, Optional, List, Literal, TypedDict
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
+#from langgraph import PromptTemplate, LLMChain
+from pipeline_helpers import *
 from prompts.decompose_rule import decompose_rule
-from prompts.evaluate_rule import evaluate_rule
+from prompts.extract_entities import extract_entities
+from prompts.spatial_planner import spatial_planner
 from prompts.decide_plan_polarity import decide_plan_polarity
 from prompts.create_summaries import summarise_spatial_results
+from prompts.evaluate_rule import evaluate_rule
 
+import functools
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+
 
 # ──────────────────────────────────────────────────────────────────────────
-# 0.  Template catalogue  (key → SQL filename or None for composed funcs)
+#  Template catalogue  (key → SQL filename or None for composed funcs)
 # ──────────────────────────────────────────────────────────────────────────
 TEMPLATE_MAP: Dict[str, str | None] = {
     # 4‑param directionals
@@ -64,221 +58,6 @@ TEMPLATE_CATALOGUE = {
     "far": "True when the distance between A and B is greater than a defined threshold."
 }
 
-# ──────────────────────────────────────────────────────────────────────────
-# 1.  Define the H&S checks you want to run
-# ──────────────────────────────────────────────────────────────────────────
-CHECKS = {
-    "extinguisher_check1": (
-        "Are all portable fire extinguishers readily accessible and not restricted by stored items?"   
-    ),
-    "extinguisher_check2": (
-        "Are portable fire extinguishers either securely wall mounted or on a supplied stand?"   
-    ),
-    "extinguisher_check3": (
-        "Are portable fire extinguishers clearly labelled?"   
-    ),
-    "ignition_check": (
-        "Have combustible materials been stored away from sources of ignition?"   
-    ),
-}
-
-'''
-    # ————— Define your checks —————
-    checks = {
-        "waste_check":         "Is waste and rubbish kept in a designated area?", # Da aggiungere oggetto area
-        "ignition_check":      "Have combustible materials been stored away from sources of ignition?", # Fatto da integrare
-        "fire_call_check":     "Are all fire alarm call points clearly signed and easily accessible?", # si può fare facile
-        "fire_escape_check1":  "Are all fire exit signs in place and unobstructed?", # si può fare facile
-        "fire_escape_check2":  "Are fire escape routes kept clear?", # da aggiungere fire escape routes come oggetto
-        "fall_check":          "Is the condition of all flooring free from trip hazards?", # da aggiungere routes come oggetto
-        "door_check":          "Are fire doors kept closed, i.e., not wedged open?", # Da aggiungere attributo a porte
-        "extinguisher_check1": "Are portable fire extinguishers clearly labelled?", # si può fare facile 
-        "extinguisher_check2": "Are all portable fire extinguishers readily accessible and not restricted by stored items?", # Fatto
-        "extinguisher_check3": "Are portable fire extinguishers either securely wall mounted or on a supplied stand?" # Fatto
-    }
-    
-    '''
-
-
-def test_r2m_office_db():
-    # ─── Configuration ────────────────────────────────────────────────────────
-    object_pairs = [
-        (98, 99),
-        (104, 78),
-        (1,  88),
-        (56, 98),
-        (98, 56),
-        (82, 83),
-        (8, 104),
-        (1, 52),
-        (5, 52),
-        (97, 102)
-    ]
-    camera_id    = 1      # for front/behind/left/right
-    scale_factor = 10.0   # for above, below, on_top, etc.
-
-    queries = {
-        "above":  "above.sql",
-        "below":  "below.sql",
-        "front":  "front.sql",
-        "behind": "behind.sql",
-        "left":   "left.sql",
-        "right":  "right.sql",
-    }
-
-    conn = psycopg2.connect(**DB_CONFIG)
-    try:
-        # Load all SQL texts
-        sql_texts = {name: load_query(fn) for name, fn in queries.items()}
-
-        # 1) Camera info
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, position, fov FROM camera WHERE id = %s", (camera_id,))
-            cam_id, cam_pos, cam_fov = cur.fetchone()
-        print(f"Camera ID={cam_id}, position={cam_pos}, fov={cam_fov}")
-
-        # 2) Build name map
-        all_ids = {oid for pair in object_pairs for oid in pair}
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, name FROM room_objects WHERE id = ANY(%s)",
-                (list(all_ids),)
-            )
-            name_map = {row[0]: row[1] for row in cur.fetchall()}
-
-        # 3) Test each pair
-        for x_id, y_id in object_pairs:
-            x_name = name_map.get(x_id, f"ID {x_id}")
-            y_name = name_map.get(y_id, f"ID {y_id}")
-
-            print(f"\nObjects: {x_name} (ID {x_id}) → {y_name} (ID {y_id})")
-
-            # Camera‐dependent relations
-            for rel in ("front", "behind", "left", "right"):
-                sql = sql_texts[rel]
-                # note: these expect args (object_y_id, object_x_id, camera_id, s)
-                row = run_query(conn, sql, (y_id, x_id, camera_id, scale_factor))[0]
-                flag = row[3]
-                status = "is" if flag else "is NOT"
-                print(f"  [{rel.title():>6}] {x_name} {status} {rel} of {y_name}")
-
-            # Camera‐independent: above & below
-            above_row = run_query(conn, sql_texts["above"], (x_id, y_id,camera_id, scale_factor))[0]
-            above_flag = above_row[3]
-            below_row = run_query(conn, sql_texts["below"], (x_id, y_id,camera_id, scale_factor))[0]
-            below_flag = below_row[3]
-
-            print(f"  [Above ] {x_name} is{' ' if above_flag else ' NOT '}above {y_name}")
-            print(f"  [Below ] {x_name} is{' ' if below_flag else ' NOT '}below {y_name}")
-
-            # Composed relations
-            print("  [On Top]   composed on_top_relation:")
-            for line in on_top_relation(x_id, y_id, camera_id, scale_factor).splitlines():
-                print("    " + line)
-
-            print("  [Leans On] composed leans_on_relation:")
-            for line in leans_on_relation(x_id, y_id, camera_id, scale_factor).splitlines():
-                print("    " + line)
-
-            print("  [Affixed]  composed affixed_to_relation:")
-            for line in affixed_to_relation(x_id, y_id, camera_id, scale_factor).splitlines():
-                print("    " + line)
-
-    finally:
-        conn.close()
-
-def fetch_types_and_names(
-    table_name: str = "room_objects",
-    id_column: str = "id",
-    type_column: str = "ifc_type",
-    name_column: str = "name",
-    *,
-    outfile: Optional[Path | str] = "ifc_types_names.txt",  # set to None to skip writing
-    file_mode: str = "w",                                   # or "a" to append
-    line_template: str = "{id}  -  {type}  -  {name}\n"     # customise if you like
-) -> List[Tuple[int, str, str]]:
-    """
-    Fetch (id, type, name) tuples from the given table/columns.
-
-    • Prints each tuple.
-    • Optionally writes them to *outfile* (text file).
-    • Returns the list of tuples [(id, type, name), …].
-
-    Parameters
-    ----------
-    id_column : str
-        Name of the ID column to fetch.
-    outfile : str | Path | None
-        Where to write the data. Pass None to disable file output.
-    file_mode : str
-        'w' = overwrite (default), 'a' = append, etc.
-    line_template : str
-        Format string for each line; supports {id}, {type}, {name}.
-    """
-    conn = get_connection()
-
-    try:
-        with conn.cursor() as cur:
-            query = sql.SQL("SELECT {id_col}, {type_col}, {name_col} FROM {tbl}").format(
-                id_col=sql.Identifier(id_column),
-                type_col=sql.Identifier(type_column),
-                name_col=sql.Identifier(name_column),
-                tbl=sql.Identifier(table_name)
-            )
-            cur.execute(query)
-            rows = cur.fetchall()  # List of (id, type, name)
-
-        # Prepare file output if requested
-        writer = None
-        if outfile is not None:
-            outfile = Path(outfile)
-            outfile.parent.mkdir(parents=True, exist_ok=True)
-            writer = outfile.open(file_mode, encoding="utf-8")
-
-        # Print and write each row
-        for obj_id, obj_type, obj_name in rows:
-            line = line_template.format(id=obj_id, type=obj_type, name=obj_name)
-            print(line.rstrip())
-            if writer:
-                writer.write(line)
-
-        if writer:
-            writer.close()
-
-        return rows
-
-    finally:
-        conn.close()
-
-def load_objects_and_maps() -> Tuple[List[Tuple[int, str, str]], Dict[int, Tuple[str, str]], List[int], Dict[str, List[int]]]:
-    """
-    Load all objects from the PostgreSQL DB and build helpful lookup maps.
-
-    Returns
-    -------
-    all_objects : List of (id, ifc_type, name) tuples
-    id_to_obj    : Dict mapping ID → (ifc_type, name)
-    all_ids      : List of all object IDs
-    type_to_ids  : Dict mapping ifc_type → list of IDs
-    """
-    print("DEBUG: Fetching all objects (id, type, name) from DB...")
-    all_objects = fetch_types_and_names()
-    print(f"DEBUG: Retrieved {len(all_objects)} objects.\n")
-
-    # Build id_to_obj mapping: ID → (ifc_type, name)
-    id_to_obj: Dict[int, Tuple[str, str]] = {
-        obj_id: (ifc_type, name) for obj_id, ifc_type, name in all_objects
-    }
-    all_ids = list(id_to_obj.keys())
-
-    # Build type_to_ids mapping: ifc_type → [IDs]
-    type_to_ids: Dict[str, List[int]] = {}
-    for obj_id, ifc_type, _ in all_objects:
-        type_to_ids.setdefault(ifc_type, []).append(obj_id)
-
-    print("DEBUG: Built ID→object and type→IDs maps.\n")
-    return all_objects, id_to_obj, all_ids, type_to_ids
-
 def prepare_template_paths() -> Dict[str, Path]:
     """
     Prepare and return a dictionary mapping template names to their SQL file paths.
@@ -291,344 +70,243 @@ def prepare_template_paths() -> Dict[str, Path]:
     print(f"DEBUG: Prepared template paths for {len(template_paths)} SQL files.\n")
     return template_paths
 
-def execute_spatial_calls(
-    plan: Dict,
-    id_to_obj: Dict[int, Tuple[str, str]],
-    type_to_ids: Dict[str, List[int]],
-    all_ids: List[int],
-    conn,
-    template_paths: Dict[str, Path],
-    log_file
-) -> List[Dict]:
+class PipeState(TypedDict):
+    rule_text: str
+    decomposed_checks: Optional[dict]
+
+    all_objects: Optional[List[Tuple[int, str, str]]]
+    id_to_obj:   Optional[Dict[int, Tuple[str, str]]]
+    all_ids:     Optional[List[int]]
+    type_to_ids: Optional[Dict[str, List[int]]]
+
+    enriched_checks: Optional[dict]
+    spatial_plan: Optional[dict]
+    relations: Optional[Any]
+    summaries: Optional[List[str]]
+    evaluation: Optional[dict]
+
+class Evaluate_Hs_Rule:
     """
-    Execute spatial calls (SQL templates) for each entry in the plan, logging and collecting
-    either positive or negative relations according to the entry's `use_positive` flag.
-
-    Now reads `use_positive` from each plan entry:
-      - If True, collects only held==True relations (as before).
-      - If False, collects only held==False relations.
+    A class for evaluating health and safety rules
     """
-    print("DEBUG: Executing spatial calls for each planned relation...")
-    results: List[Dict] = []
+    def __init__(self, model_name: str = "gpt-4.1-mini-2025-04-14"):
+        self.llm = get_llm(model_name=model_name)
+        self.chain = None
+        self.build_workflow()
 
-    # Iterate through each planned check entry
-    for entry in plan.get("plans", []):
-        idx          = entry["check_index"]
-        use_positive = entry.get("use_positive", True)
-        print(f"DEBUG: check_index={idx}, use_positive={use_positive}")
+    def build_workflow(self):
+        workflow = StateGraph(PipeState)
 
-        for tmpl in entry["templates"]:
-            tpl_name = tmpl["template"]
-            a_src, b_src = tmpl["a_source"], tmpl["b_source"]
+        workflow.add_node("decompose rule", self.decompose_rule)
+        workflow.add_node("load objects", self.load_objects)
+        workflow.add_node("enrich checks", self.enrich_checks)
+        workflow.add_node("spatial plan", self.spatial_plan)
+        workflow.add_node("decide polarity", self.decide_polarity)
+        workflow.add_node("execute planned relations", self.execute_planned_relations)
+        workflow.add_node("summarise results", self.summarise_results)
+        workflow.add_node("evaluate rule", self.evaluate_rule)
 
-            # Determine reference IDs (a_ids)
-            if a_src == "reference_ids":
-                a_ids = entry["reference"]["reference_ids"]
-            elif a_src == "reference_ifc_types":
-                a_ids = [
-                    oid
-                    for t in entry["reference"].get("reference_ifc_types", [])
-                    for oid in type_to_ids.get(t, [])
-                ]
-            else:  # any_nearby
-                a_ids = entry["reference"]["reference_ids"]
+        workflow.add_edge(START,"load objects")
+        workflow.add_edge("load objects", "decompose rule" )
+        workflow.add_edge("decompose rule", "enrich checks")
+        workflow.add_edge("enrich checks", "spatial plan")
+        workflow.add_edge("spatial plan", "decide polarity")
+        workflow.add_edge("decide polarity", "execute planned relations")
+        workflow.add_edge("execute planned relations", "summarise results")
+        workflow.add_edge("summarise results", "evaluate rule")
+        workflow.add_edge("evaluate rule", END)
 
-            # Determine against IDs (b_ids)
-            if b_src == "against_ids":
-                b_ids = entry["against"]["against_ids"]
-            elif b_src == "against_ifc_types":
-                b_ids = [
-                    oid
-                    for t in entry["against"].get("against_ifc_types", [])
-                    for oid in type_to_ids.get(t, [])
-                ]
-            else:  # any_nearby
-                b_ids = all_ids
+        self.workflow = workflow
+        self.chain = workflow.compile()
+        return self.chain
 
-            # Run the spatial function 1-to-1 for each pair
-            for a_id in a_ids:
-                a_type, a_name = id_to_obj[a_id]
-                for b_id in b_ids:
-                    if a_id == b_id:
-                        continue
+    def decompose_rule(self, state: PipeState) -> PipeState:
+        state["decomposed_checks"] = decompose_rule(state["rule_text"], self.llm)
+        return state
 
-                    b_type, b_name = id_to_obj[b_id]
-                    call = {"type":"template","template":tpl_name,"a_id":b_id,"b_id":a_id}
+    def load_objects(self, state: PipeState) -> PipeState:
+        all_objs, id2obj, ids, type2ids = load_objects_and_maps()
+        state["all_objects"] = all_objs
+        state["id_to_obj"] = id2obj
+        state["all_ids"] = ids
+        state["type_to_ids"] = type2ids
+        return state
 
-                    # Log request
-                    log_file.write("=== SPATIAL CALL ===\n")
-                    log_file.write(json.dumps(call, ensure_ascii=False) + "\n")
+    def enrich_checks(self, state: PipeState) -> PipeState:
+        enriched = extract_entities(
+            state["decomposed_checks"],
+            state["all_objects"],
+            self.llm
+        )
+        state["enriched_checks"] = enriched
+        return state
 
-                    result = run_spatial_call(conn, call, template_paths)
+    def spatial_plan(self, state: PipeState) -> PipeState:
+        plan = spatial_planner(
+            state["enriched_checks"],
+            TEMPLATE_CATALOGUE,
+            self.llm
+        )
+        state["spatial_plan"] = plan
+        return state
 
-                    # Log result
-                    log_file.write("RESULT:\n")
-                    log_file.write(json.dumps(result, ensure_ascii=False) + "\n\n")
-                    log_file.flush()
+    def decide_polarity(self, state: PipeState) -> PipeState:
+        decisioned = decide_plan_polarity(
+            state["rule_text"],
+            state.get("spatial_plan", {}),
+            self.llm
+        )
+        state["spatial_plan"] = decisioned
+        return state
 
-                    # Determine held
-                    held = False
-                    rows = result.get("rows", [])
-                    relation_value = None
-                    if rows:
-                        first = rows[0]
-                        # Here every query should be stantardized for optimization so the output can be accessed in the same way
-                        if tpl_name == "touches":
-                            held = bool(first[0]);       relation_value = first[1]
-                        elif tpl_name in {"front","left","right","behind","above","below"}:
-                            held = bool(first[3]);       relation_value = first[4] if held else None
-                        elif tpl_name in {"near","far"}:
-                            is_near = bool(first[2]);    is_far = bool(first[3])
-                            held = is_near if tpl_name=="near" else is_far
-                            relation_value = first[0]
-                        else:  # composed relations
-                            held = bool(first[0]);       relation_value = first[1] if len(first)>1 else None
-
-                    # Record only if held matches use_positive
-                    if held == use_positive:
-                        results.append({
-                            "check_index":    idx,
-                            "template":       tpl_name,
-                            "a_id":           a_id,
-                            "a_name":         a_name,
-                            "a_type":         a_type,
-                            "b_id":           b_id,
-                            "b_name":         b_name,
-                            "b_type":         b_type,
-                            "relation_value": relation_value
-                        })
-
-    print(f"DEBUG: Collected {len(results)} relations (use_positive={use_positive}).\n")
-    return results
-
-
-def build_summaries(
-    plan: Dict,
-    positive_relations: List[Dict],
-    id_to_obj: Dict[int, Tuple[str, str]]
-) -> List[str]:
-    """
-    Build human‐readable summaries for each reference entry based on positive relations.
-
-    Parameters
-    ----------
-    plan                : The plan dict returned by spatial_planner()
-    positive_relations  : List of dicts describing each held relation
-    id_to_obj           : ID→(ifc_type, name) map
-
-    Returns
-    -------
-    summaries : List of strings, each summarizing one reference check
-    """
-    print("DEBUG: Building human‐readable summaries for each check entry...")
-    summaries: List[str] = []
-
-    # Mapping from template name to a phrase for readability
-    relation_phrases = {
-        "touches": "touches",
-        "front":   "are in front of",
-        "right":   "are to the right of",
-        "left":    "are to the left of",
-        "behind":  "are behind",
-        "above":   "are above",
-        "below":   "are below",
-        "near":    "are near",
-        "far":     "are far from",
-    }
-
-    for entry in plan.get("plans", []):
-        idx = entry["check_index"]
-        relation_text = entry.get("relation_text", "")
-        templates_list = [t["template"] for t in entry["templates"]]
-
-        # Describe the "against" clause
-        against = entry["against"]
-        if against["type"] == "any":
-            against_desc = "all objects in the DB"
-        elif against["type"] == "category":
-            types = ", ".join(against["against_ifc_types"])
-            against_desc = f"objects of IFC types: {types}"
-        else:
-            against_desc = f"specific objects matching '{against['value']}'"
-
-        # Determine reference items and labels
-        if entry["reference"]["type"] == "object":
-            ref_ids = entry["reference"]["reference_ids"]
-            ref_items = [
-                (rid, *id_to_obj[rid], f"Object {rid} ({id_to_obj[rid][1]})")
-                for rid in ref_ids
-            ]
-        else:
-            # category reference
-            ref_items = [
-                (None, rft, None, f"All objects of IFC type {rft}")
-                for rft in entry["reference"]["reference_ifc_types"]
-            ]
-
-        # For each reference item, build a header and detail lines
-        for a_id, a_type, a_name, ref_label in ref_items:
-            against_value = entry["against"]["value"]
-            header = (
-                f"{ref_label}: is it \"{relation_text}\" with respect to "
-                f"\"{against_value}\"? To check, we ran relations "
-                f"{templates_list} between {ref_label} and {against_desc}."
+    def execute_planned_relations(self, state: PipeState) -> PipeState:
+        template_paths = prepare_template_paths()
+        log_path = Path(__file__).parent / "spatial_calls.log"
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            relations = execute_spatial_calls(
+                state["spatial_plan"],
+                state["id_to_obj"],
+                state["type_to_ids"],
+                state["all_ids"],
+                template_paths,
+                log_file
             )
+        state["relations"] = relations
+        return state
 
-            details: List[str] = []
-            for tpl_name in templates_list:
-                # Gather positive relations for this reference and template
-                rels_tpl = []
-                for pr in positive_relations:
-                    if pr["check_index"] != idx or pr["template"] != tpl_name:
-                        continue
-                    if a_id is not None and pr["a_id"] != a_id:
-                        continue
-                    rels_tpl.append(pr)
-
-                if not rels_tpl:
-                    continue
-
-                verb = relation_phrases.get(tpl_name, tpl_name)
-                target_list = ", ".join(
-                    f"{pr['b_name']} (ID:{pr['b_id']})" for pr in rels_tpl
-                )
-                details.append(
-                    f"The following objects {verb} {ref_label}: {target_list}."
-                )
-
-            # Combine header and details
-            if details:
-                summary = header + " " + " ".join(details)
-            else:
-                summary = header + " No positive relations found."
-
-            summaries.append(summary)
-
-    print(f"DEBUG: Built {len(summaries)} summaries.\n")
-    return summaries
-
-def process_checks(
-    conn,
-    all_objects: List[Tuple[int, str, str]],
-    id_to_obj: Dict[int, Tuple[str, str]],
-    all_ids: List[int],
-    type_to_ids: Dict[str, List[int]],
-    template_paths: Dict[str, Path],
-    log_file
-) -> Dict[str, Dict]:
-    """
-    Process each check in CHECKS: decompose, enrich, plan, execute spatial calls,
-    build summaries, and evaluate rule compliance.
-
-    Returns a dict mapping check_key → results dict.
-    """
-    pipeline_results: Dict[str, Dict] = {}
-
-    for key, rule in CHECKS.items():
-        print(f"\n=== Processing check: {key} ===")
-        #print(f"DEBUG: Rule text: {rule}\n")
-
-        # A) Decompose rule into subchecks
-        print("DEBUG: Decomposing rule...")
-        decomposed = decompose_rule(rule, client)
-        #print("DEBUG: Decomposed checks:", json.dumps(decomposed, indent=2, ensure_ascii=False), "\n")
-
-        # B) Enrich decomposed checks with entities from DB
-        print("DEBUG: Enriching decomposed checks with entities...")
-        enriched = extract_entities(decomposed, all_objects, client)
-        #print("DEBUG: Enriched entities:", json.dumps(enriched, indent=2, ensure_ascii=False), "\n")
-
-        # C) Plan spatial queries using the LLM-based planner
-        print("DEBUG: Planning spatial queries...")
-        plan = spatial_planner(enriched, TEMPLATE_CATALOGUE, client)
-        #print("DEBUG: Spatial plan:", json.dumps(plan, indent=2, ensure_ascii=False), "\n")
-
-        # D) Enrich spatial plans adding entries for plan polarity
-        print("DEBUG: Deciding Spatial Plan Polarity...")
-        enriched_plan = decide_plan_polarity(rule, plan, client)
-        #print("DEBUG: Enriched Spatial plan with Polarity:", json.dumps(enriched_plan, indent=2, ensure_ascii=False), "\n")
-
-        # D) Execute spatial calls and collect positive relations
-        relations = execute_spatial_calls(
-            enriched_plan, id_to_obj, type_to_ids, all_ids, conn, template_paths, log_file
+    def summarise_results(self, state: PipeState) -> PipeState:
+        summaries = summarise_spatial_results(
+            state.get("spatial_plan", {}),
+            state.get("relations", []),
+            self.llm
         )
+        state["summaries"] = summaries
+        return state
 
-        # E) Build human-readable summaries from positive relations
-        #summaries = build_summaries(plan, relations, id_to_obj)
-        summaries= summarise_spatial_results(plan,relations,client)
+    def evaluate_rule(self, state: PipeState) -> PipeState:
+        evaluation = evaluate_rule(
+            state["rule_text"],
+            state.get("summaries", []),
+            self.llm
+        )
+        state["evaluation"] = evaluation
+        return state
 
-        # F) Evaluate rule compliance using the summaries and original rule
-        print("DEBUG: Evaluating rule compliance...")
-        evaluation = evaluate_rule(rule, summaries, client)
-        print("DEBUG: Evaluation result:", json.dumps(evaluation, indent=2, ensure_ascii=False), "\n")
-
-        # Collect all results for this check
-        pipeline_results[key] = {
-            "rule":              rule,
-            "decomposed_checks": decomposed,
-            "enriched_checks":   enriched,
-            "spatial_plan":      plan,
-            "results":           relations,
-            "summaries":         summaries,
-            "evaluation":        evaluation
+    def run_hs_rule_validator(self, rule_text: str) -> Dict[str, Any]:
+        if self.chain is None:
+            self.build_workflow()
+        initial_state: PipeState = {
+            "rule_text": rule_text,
+            "decomposed_checks": None,
+            "all_objects": None,
+            "id_to_obj": None,
+            "all_ids": None,
+            "type_to_ids": None,
+            "enriched_checks": None,
+            "spatial_plan": None,
+            "relations": None,
+            "summaries": None,
+            "evaluation": None,
         }
+        return self.chain.invoke(initial_state)
 
-    return pipeline_results
+    def visualize(self, engine: str = "mermaid", filename: Optional[Path] = None):
+        """
+        Display or save a visualization of the workflow graph.
 
-# ──────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────
+        Parameters:
+        - engine: "mermaid" (default) or "graphviz" for a more detailed node/edge view.
+        - filename: Optional path to write the image file (png).
+        """
+        graph = self.chain.get_graph()
+        # Choose rendering engine
+        if engine == "graphviz":
+            # Graphviz often includes richer node labels and layout
+            img_bytes = graph.draw_graphviz(format="png")
+        else:
+            # Mermaid layout is lightweight and interactive in notebooks
+            img_bytes = graph.draw_mermaid_png()
+        # Optionally save to file
+        if filename:
+            with open(filename, "wb") as f:
+                f.write(img_bytes)
+            print(f"DEBUG: Workflow diagram saved to {filename}")
+        # Display inline in Jupyter/IPython
+        from IPython.display import display, Image
 
-def main():
-    """
-    Main entry point:
-    1. Set up OpenAI key
-    2. Load objects and mappings from DB
-    3. Prepare template file paths
-    4. Open log file for spatial calls
-    5. Process all checks
-    6. Write results to output JSON
-    """
-    # Configure OpenAI
-    openai.api_key = MY_OPENAI_KEY
-    global client
-    client = openai
-
-    # 1) Load all objects and build lookup maps
-    all_objects, id_to_obj, all_ids, type_to_ids = load_objects_and_maps()
-
-    # 2) Prepare template file paths for SQL execution
-    template_paths = prepare_template_paths()
-
-    # 3) Open a debug log for spatial calls
-    log_path = Path(__file__).parent / "spatial_calls.log"
-    print(f"DEBUG: Opening spatial calls log at {log_path} (append mode).")
-    log_file = open(log_path, "w", encoding="utf-8")
-
-    # 4) Connect to the database and process checks
-    with get_connection() as conn:
-        pipeline_results = process_checks(
-            conn,
-            all_objects,
-            id_to_obj,
-            all_ids,
-            type_to_ids,
-            template_paths,
-            log_file
-        )
-
-    # Close the log file
-    log_file.close()
-    print("DEBUG: Closed spatial calls log.\n")
-
-    # 5) Write pipeline results (including summaries) to JSON file
-    output_path = Path(__file__).parent / "pipeline_output.json"
-    print(f"DEBUG: Writing pipeline results to {output_path}.")
-    with open(output_path, "w", encoding="utf-8") as fp:
-        json.dump(pipeline_results, fp, ensure_ascii=False, indent=2)
-
-    print("\nDone! Summaries and results written to pipeline_output.json")
-
+        return display(Image(img_bytes))
 
 if __name__ == "__main__":
-    main()
+    # ————— Define your checks ————— 
+    
+    rules = {
+        "extinguisher_check1": "Are all portable fire extinguishers readily accessible and not restricted by stored items?",
+        "extinguisher_check2": "Are portable fire extinguishers either securely wall mounted or on a supplied stand?",
+        "extinguisher_check3": "Are portable fire extinguishers clearly labelled?",
+        "ignition_check":      "Have combustible materials been stored away from sources of ignition?",
+    }
+
+    # Prepare output directory
+    outputs_dir = Path(__file__).parent / "outputs_results"
+    outputs_dir.mkdir(exist_ok=True)
+
+    validator = Evaluate_Hs_Rule()
+    final_summary: Dict[str, Any] = {}
+    
+
+    # Iterate over each rule and run pipeline
+    for name, text in rules.items():
+        print(f"DEBUG: Processing rule '{name}'...")
+        results = validator.run_hs_rule_validator(text)
+        # Filter out large fields
+        filtered = {k: v for k, v in results.items() if k not in ("all_objects", "all_ids","id_to_obj","type_to_ids")}
+        # Per-rule output file
+        rule_file = outputs_dir / f"{name}.json"
+        print(f"DEBUG: Writing results for '{name}' to {rule_file}.")
+        with open(rule_file, "w", encoding="utf-8") as f:
+            json.dump(filtered, f, ensure_ascii=False, indent=2)
+        # Collect only the final evaluation for summary
+        final_summary[name] = filtered.get("evaluation")
+
+    # Write consolidated summary
+    summary_file = outputs_dir / "final_results.json"
+    print(f"DEBUG: Writing consolidated summary to {summary_file}.")
+    with open(summary_file, "w", encoding="utf-8") as sf:
+        json.dump(final_summary, sf, ensure_ascii=False, indent=2)
+
+    print("Done! Individual rule outputs and final summary written to 'outputs_results'.")
+
+    '''
+
+    # Render and save workflow visualization
+    graph = validator.chain.get_graph()
+    png_bytes = graph.draw_mermaid_png()
+    viz_path = Path(__file__).parent / "graph_workflow.png"
+    with open(viz_path, "wb") as viz_file:
+        viz_file.write(png_bytes)
+    print(f"DEBUG: Workflow diagram saved to {viz_path}")
+    '''
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+# 1.  Define the H&S checks you want to run
+# ──────────────────────────────────────────────────────────────────────────
+
+'''
+    # ————— Define your checks —————
+    rules = {
+        "waste_check":         "Is waste and rubbish kept in a designated area?", # Da aggiungere oggetto area
+        "fire_call_check":     "Are all fire alarm call points clearly signed and easily accessible?", # si può fare facile
+        "fire_escape_check1":  "Are all fire exit signs in place and unobstructed?", # si può fare facile
+        "fire_escape_check2":  "Are fire escape routes kept clear?", # da aggiungere fire escape routes come oggetto
+        "fall_check":          "Is the condition of all flooring free from trip hazards?", # da aggiungere routes come oggetto
+        "door_check":          "Are fire doors kept closed, i.e., not wedged open?", # Da aggiungere attributo a porte
+
+
+        "extinguisher_check1": "Are portable fire extinguishers clearly labelled?", # si può fare facile +
+        "extinguisher_check2": "Are all portable fire extinguishers readily accessible and not restricted by stored items?", # Fatto +
+        "extinguisher_check3": "Are portable fire extinguishers either securely wall mounted or on a supplied stand?" # Fatto +
+        "ignition_check":      "Have combustible materials been stored away from sources of ignition?", # Fatto da integrare +
+    }
+    
+    '''

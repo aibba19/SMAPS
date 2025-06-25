@@ -1,37 +1,19 @@
-﻿import json, re
+﻿import json
+import re
 from typing import Dict
 
-def decompose_rule(hs_rule: str, client , model = "gpt-4.1-mini-2025-04-14" ) -> Dict:
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+
+def decompose_rule(hs_rule: str, client, model: str = "gpt-4.1-mini-2025-04-14") -> Dict:
     """
     Decompose a single health-and-safety rule into atomic checks.
-
-    Example output:
-    {
-      "checks": [
-        {
-          "reference": { "type": "object",  "value": "Fire extinguisher" },
-          "relation" : "unobstructed_by",
-          "against"  : { "type": "category", "value": "stored items" }
-        },
-        {
-          "reference": { "type": "category", "value": "Fire alarm call point" },
-          "relation" : "clearly_signed",
-          "against"  : { "type": "any" }
-        }
-      ]
-    }
-
-    Keys
-    ----
-    reference / against
-        • type  : "object" | "category" | "any"
-        • value : literal text taken from, or inferred from, the rule
-    relation
-        • Canonical verb / predicate describing what must be checked.
     """
-
-    prompt = f"""
-        <task>
+    # Full task text (unchanged)
+    prompt_text = """<task>
         You will convert one health-and-safety rule into a JSON plan for later
         spatial checks.
 
@@ -63,23 +45,27 @@ def decompose_rule(hs_rule: str, client , model = "gpt-4.1-mini-2025-04-14" ) ->
            pairs.
         7. Return valid JSON only. No markdown, no code fences, no extra keys.
         </task>
-
-        <rule>
-        {hs_rule}
-        </rule>
         """
 
-    # LLM call
-    resp = client.chat.completions.create(
-        model=model,
+    # Append the actual rule
+    human_content = f"{prompt_text}\n<rule>{hs_rule}</rule>"
+
+    # Build a ChatPromptTemplate with a single system + single human message
+    prompt_template = ChatPromptTemplate(
+        input_variables=["hs_rule"],
         messages=[
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user",   "content": prompt}
+            SystemMessagePromptTemplate.from_template("Return valid JSON only."),
+            HumanMessagePromptTemplate.from_template(human_content),
         ],
     )
 
-    content = resp.choices[0].message.content.strip()
+    # Render and invoke
+    rendered = prompt_template.format_prompt(hs_rule=hs_rule).to_messages()
+    result = client.invoke(rendered, model=model)
+
+    # Clean and parse
+    content = getattr(result, "content", str(result))
     if content.startswith("```"):
-        content = re.sub(r"```json\s*|\s*```", "", content, flags=re.I).strip()
+        content = re.sub(r"```json\s*|```\s*$", "", content, flags=re.IGNORECASE).strip()
 
     return json.loads(content)
